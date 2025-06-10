@@ -341,7 +341,7 @@ pub fn main() !void {
                     else => {},
                 }
             }
-            time.sleep(50 * time.ns_per_ms);
+            time.sleep(16 * time.ns_per_ms);
         } else {
             // Unix-like systems use poll
             var fds = [_]std.posix.pollfd{
@@ -352,8 +352,8 @@ pub fn main() !void {
                 },
             };
             
-            // Poll with 50ms timeout
-            const poll_result = try std.posix.poll(&fds, 50);
+            // Poll with 16ms timeout for 60 FPS
+            const poll_result = try std.posix.poll(&fds, 16);
             
             if (poll_result > 0 and (fds[0].revents & std.posix.POLL.IN) != 0) {
                 const bytes_read = try stdin.read(&buffer);
