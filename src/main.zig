@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io = std.io;
 const time = std.time;
+const os = std.os;
 
 const Stopwatch = struct {
     start_time: ?i64 = null,
@@ -69,6 +71,62 @@ fn showCursor() void {
     stdout.print("\x1b[?25h", .{}) catch {};
 }
 
+const RawMode = struct {
+    original: switch (builtin.os.tag) {
+        .macos, .linux, .freebsd, .netbsd, .dragonfly, .openbsd => std.c.termios,
+        .windows => void,
+        else => void,
+    },
+    
+    fn enable() !RawMode {
+        switch (builtin.os.tag) {
+            .macos, .linux, .freebsd, .netbsd, .dragonfly, .openbsd => {
+                const stdin_fd = io.getStdIn().handle;
+                const original = try std.posix.tcgetattr(stdin_fd);
+                
+                var raw = original;
+                // Disable canonical mode, echo, and signals
+                raw.lflag.ECHO = false;
+                raw.lflag.ICANON = false;
+                raw.lflag.ISIG = false;
+                raw.lflag.IEXTEN = false;
+                
+                // Disable input processing
+                raw.iflag.IXON = false;
+                raw.iflag.ICRNL = false;
+                raw.iflag.BRKINT = false;
+                raw.iflag.INPCK = false;
+                raw.iflag.ISTRIP = false;
+                
+                // Set minimum characters and timeout
+                raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
+                raw.cc[@intFromEnum(std.posix.V.TIME)] = 1;
+                
+                try std.posix.tcsetattr(stdin_fd, .NOW, raw);
+                
+                return RawMode{ .original = original };
+            },
+            .windows => {
+                // Windows doesn't need raw mode for basic input
+                return RawMode{ .original = {} };
+            },
+            else => {
+                return RawMode{ .original = {} };
+            },
+        }
+    }
+    
+    fn disable(self: *const RawMode) void {
+        switch (builtin.os.tag) {
+            .macos, .linux, .freebsd, .netbsd, .dragonfly, .openbsd => {
+                const stdin_fd = io.getStdIn().handle;
+                std.posix.tcsetattr(stdin_fd, .NOW, self.original) catch {};
+            },
+            else => {},
+        }
+    }
+};
+
 fn restoreTerminal() void {
     showCursor();
     clearScreen();
@@ -76,54 +134,20 @@ fn restoreTerminal() void {
 
 pub fn main() !void {
     const stdout = io.getStdOut().writer();
-    
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    const stdin = io.getStdIn().reader();
     
     var stopwatch = Stopwatch{};
+    
+    // Enable raw mode for keyboard input
+    const raw_mode = try RawMode.enable();
+    defer raw_mode.disable();
     
     clearScreen();
     hideCursor();
     defer restoreTerminal();
     
-    try stdout.print("TUI Stopwatch\n", .{});
-    try stdout.print("Commands: [SPACE] Start/Stop | [R] Reset | [Q] Quit\n\n", .{});
-    
     var running = true;
-    
-    // Create a thread for keyboard input
-    const KeyboardThread = struct {
-        fn run(sw: *Stopwatch, is_running: *bool) !void {
-            const reader = io.getStdIn().reader();
-            var buffer: [1]u8 = undefined;
-            
-            while (is_running.*) {
-                if (try reader.read(&buffer) > 0) {
-                    const key = buffer[0];
-                    
-                    switch (key) {
-                        ' ' => {
-                            if (sw.is_running) {
-                                sw.stop();
-                            } else {
-                                sw.start();
-                            }
-                        },
-                        'r', 'R' => {
-                            sw.reset();
-                        },
-                        'q', 'Q' => {
-                            is_running.* = false;
-                        },
-                        else => {},
-                    }
-                }
-            }
-        }
-    };
-    
-    const keyboard_thread = try std.Thread.spawn(.{}, KeyboardThread.run, .{ &stopwatch, &running });
-    defer keyboard_thread.join();
+    var buffer: [1]u8 = undefined;
     
     while (running) {
         clearScreen();
@@ -146,6 +170,67 @@ pub fn main() !void {
             try stdout.print("\t[STOPPED]\n", .{});
         }
         
-        time.sleep(50 * time.ns_per_ms);
+        // Check for keyboard input
+        if (builtin.os.tag == .windows) {
+            // Windows doesn't support poll, use blocking read with timeout
+            const bytes_read = stdin.read(&buffer) catch 0;
+            if (bytes_read > 0) {
+                const key = buffer[0];
+                
+                switch (key) {
+                    ' ' => {
+                        if (stopwatch.is_running) {
+                            stopwatch.stop();
+                        } else {
+                            stopwatch.start();
+                        }
+                    },
+                    'r', 'R' => {
+                        stopwatch.reset();
+                    },
+                    'q', 'Q' => {
+                        running = false;
+                    },
+                    else => {},
+                }
+            }
+            time.sleep(50 * time.ns_per_ms);
+        } else {
+            // Unix-like systems use poll
+            var fds = [_]std.posix.pollfd{
+                .{
+                    .fd = io.getStdIn().handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+            };
+            
+            // Poll with 50ms timeout
+            const poll_result = try std.posix.poll(&fds, 50);
+            
+            if (poll_result > 0 and (fds[0].revents & std.posix.POLL.IN) != 0) {
+                const bytes_read = try stdin.read(&buffer);
+                if (bytes_read > 0) {
+                    const key = buffer[0];
+                    
+                    switch (key) {
+                        ' ' => {
+                            if (stopwatch.is_running) {
+                                stopwatch.stop();
+                            } else {
+                                stopwatch.start();
+                            }
+                        },
+                        'r', 'R' => {
+                            stopwatch.reset();
+                        },
+                        'q', 'Q' => {
+                            running = false;
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
     }
 }
